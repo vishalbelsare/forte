@@ -14,13 +14,15 @@
 import itertools as it
 import logging
 import os
+import warnings
 from abc import ABC
 from pathlib import Path
-from typing import Optional, Any, List, Dict, Set, Tuple
+from typing import Optional, Any, List, Dict, Set, Tuple, cast
 from numpy import ndarray
 
 from forte.data.ontology.code_generation_exceptions import (
     CodeGenerationException,
+    OntologyGenerationWarning,
 )
 from forte.data.ontology.ontology_code_const import (
     SUPPORTED_PRIMITIVES,
@@ -173,10 +175,10 @@ class ImportManager:
             if class_name not in self.__short_name_pool:
                 self.__short_name_pool.add(class_name)
             else:
-                logging.warning(
-                    "Re-declared a new class named [%s]"
+                warnings.warn(
+                    f"Re-declared a new class named [{class_name}]"
                     ", which is probably used in import.",
-                    class_name,
+                    OntologyGenerationWarning,
                 )
             self.__defining_names[full_name] = class_name
 
@@ -540,10 +542,10 @@ class EntryDefinition(Item):
         self,
         name: str,
         class_type: str,
-        init_args: Optional[str] = None,
-        properties: Optional[List[Property]] = None,
-        class_attributes: Optional[List[ClassTypeDefinition]] = None,
-        description: Optional[str] = None,
+        init_args: List[str],
+        properties: List[Property],
+        class_attributes: List[ClassTypeDefinition],
+        description: str,
     ):
         super().__init__(name, description)
         self.class_type = class_type
@@ -554,11 +556,12 @@ class EntryDefinition(Item):
             [] if class_attributes is None else class_attributes
         )
         self.description = description if description else None
-        self.init_args = init_args if init_args is not None else ""
-        self.init_args = self.init_args.replace("=", " = ")
+        self.init_args = init_args if init_args is not None else []
 
     def to_init_code(self, level: int) -> str:
-        return indent_line(f"def __init__(self, {self.init_args}):", level)
+        return indent_line(
+            f"def __init__({', '.join(self.init_args)}):", level
+        ).replace("=", " = ")
 
     def to_property_code(self, level: int) -> str:
         lines = []
@@ -576,7 +579,7 @@ class EntryDefinition(Item):
 
     def to_code(self, level: int) -> str:
         super_args = ", ".join(
-            [item.split(":")[0].strip() for item in self.init_args.split(",")]
+            [item.split(":")[0].strip() for item in self.init_args[1:]]
         )
         raw_desc = self.to_description(1)
         desc: str = "" if raw_desc is None else raw_desc
@@ -638,7 +641,7 @@ class ModuleWriter:
 
     def __init__(self, module_name: str, import_managers: ImportManagerPool):
         self.module_name = module_name
-        self.source_file: str = ""
+        self.source_file: Path
 
         self.description: Optional[str] = None
         self.import_managers: ImportManagerPool = import_managers
@@ -660,7 +663,7 @@ class ModuleWriter:
         namespace_depth: int,
     ):
         """
-        Create entry sub-directories with .generated file to indicate the
+        Create entry subdirectories with .generated file to indicate the
          subdirectory is created by this procedure. No such file will be added
          if the directory already exists.
 
@@ -759,7 +762,7 @@ class ModuleWriter:
 
     def to_description(self, level):
         quotes = '"""'
-        lines = get_ignore_error_lines(self.source_file) + [
+        lines = get_ignore_error_lines(str(self.source_file)) + [
             quotes,
             self.description,
             quotes,
@@ -792,15 +795,29 @@ class ModuleWriterPool:
 
 class EntryTreeNode:
     def __init__(self, name: str):
-        self.children: List[EntryTreeNode] = []
-        self.parent: Optional[EntryTreeNode] = None
+        self.__children: List[EntryTreeNode] = []
+        self.__parent: Optional[EntryTreeNode] = None
         self.name: str = name
-        self.attributes: Set[str] = set()
+        self.attributes: Set[Tuple[str, str]] = set()
 
     def __repr__(self):
         r"""for printing purpose."""
-        attr_str = ", ".join(self.attributes)
+        attr_str = ", ".join(str(a) for a in self.attributes)
         return self.name + ": " + attr_str
+
+    @property
+    def children(self) -> "List[EntryTreeNode]":
+        return self.__children
+
+    @property
+    def parent(self) -> "EntryTreeNode":
+        if self.__parent is None:
+            raise ValueError("No parent for this node, probably root")
+        return self.__parent
+
+    @parent.setter
+    def parent(self, value):
+        self.__parent = value
 
 
 class EntryTree:
@@ -815,7 +832,7 @@ class EntryTree:
         self,
         curr_entry_name: str,
         parent_entry_name: str,
-        curr_entry_attr: Set[str],
+        curr_entry_attr: Set[Tuple[str, str]],
     ):
         r"""Add a tree node with `curr_entry_name` as a child to
         `parent_entry_name` in the tree, the attributes `curr_entry_attr`
@@ -844,17 +861,15 @@ class EntryTree:
         else:
             found_node.attributes = curr_entry_attr
 
-    def print_traverse(self):
-        path = []
-        traverse(self.root, path)
-
     def collect_parents(self, node_dict: Dict[str, Set[str]]):
         r"""Collect all the parent nodes for all the nodes in the `node_dict`
         and add the types and attributes of these parent nodes to `node_dict`.
 
         Args:
             node_dict: the nodes dictionary of nodes to collect parent nodes
-                for.
+                for. The entry represented by nodes in this dictionary do not store
+                type information of its attributes. This dictionary does not store
+                the type information of the nodes.
 
         """
         input_node_dict = node_dict.copy()
@@ -862,9 +877,9 @@ class EntryTree:
             found_node = search(self.root, search_node_name=node_name)
             if found_node is not None:
                 while found_node.parent.name != "root":
-                    node_dict[
-                        found_node.parent.name
-                    ] = found_node.parent.attributes
+                    node_dict[found_node.parent.name] = set(
+                        val[0] for val in found_node.parent.attributes
+                    )
                     found_node = found_node.parent
 
     def todict(self) -> Dict[str, Any]:
@@ -904,12 +919,18 @@ class EntryTree:
 
         if parent_entry_name is None:
             self.root = EntryTreeNode(name=tree_dict["name"])
-            self.root.attributes = set(tree_dict["attributes"])
+            self.root.attributes = set(
+                cast(Tuple[str, str], tuple(attr))
+                for attr in tree_dict["attributes"]
+            )
         else:
             self.add_node(
                 curr_entry_name=tree_dict["name"],
                 parent_entry_name=parent_entry_name,
-                curr_entry_attr=set(tree_dict["attributes"]),
+                curr_entry_attr=set(
+                    cast(Tuple[str, str], tuple(attr))
+                    for attr in tree_dict["attributes"]
+                ),
             )
         for child in tree_dict["children"]:
             self.fromdict(child, tree_dict["name"])

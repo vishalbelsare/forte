@@ -49,6 +49,11 @@ class LinkExtractor(BaseExtractor):
         # pylint: disable=attribute-defined-outside-init
         super().initialize(config)
 
+        if self.config is None:
+            raise ProcessorConfigError(
+                "Configuration for the extractor cannot be None."
+            )
+
         if self.config.attribute is None:
             raise ProcessorConfigError(
                 "'attribute' is required in this extractor."
@@ -66,17 +71,17 @@ class LinkExtractor(BaseExtractor):
 
             if not issubclass(self._entry_class, Link):
                 raise ProcessorConfigError(
-                    "`entry_class` to this extractor " "must be a Link tpe."
+                    "`entry_class` to this extractor must be a Link tpe."
                 )
 
-            self._parent_class: Type[Annotation] = self._entry_class.ParentType
+            self._parent_class: Type[Annotation] = self._entry_class.ParentType  # type: ignore
             if not issubclass(self._parent_class, Annotation):
                 raise ProcessorConfigError(
                     f"The parent class of the provided {self.config.entry_type}"
                     " must be an Annotation."
                 )
 
-            self._child_class: Type[Annotation] = self._entry_class.ChildType
+            self._child_class: Type[Annotation] = self._entry_class.ChildType  # type: ignore
             if not issubclass(self._child_class, Annotation):
                 raise ProcessorConfigError(
                     f"The child class of the provided {self.config.entry_type}"
@@ -118,6 +123,10 @@ class LinkExtractor(BaseExtractor):
         Returns:
             None
         """
+        if self.config is None:
+            raise ProcessorConfigError(
+                "Configuration for the extractor not found."
+            )
 
         entry: Entry
         for entry in pack.get(self.config.entry_type, context):
@@ -138,6 +147,11 @@ class LinkExtractor(BaseExtractor):
         Returns:
 
         """
+        if self.config is None:
+            raise ProcessorConfigError(
+                "Configuration for the extractor not found."
+            )
+
         index_annotations: List[Annotation] = list(
             pack.get(self.config.index_annotation, context)
         )
@@ -196,6 +210,11 @@ class LinkExtractor(BaseExtractor):
                 If None, then the whole data pack will be used as the
                 context. Default is None.
         """
+        if self.config is None:
+            raise ProcessorConfigError(
+                "Configuration for the extractor not found."
+            )
+
         index_entries: List[Annotation] = list(
             pack.get(self.config.index_annotation, context)
         )

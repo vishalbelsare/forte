@@ -6,7 +6,7 @@ from forte.data.base_reader import PackReader, MultiPackReader
 from forte.data.data_pack import DataPack
 from forte.data.multi_pack import MultiPack
 from forte.data.ontology import Generics, MultiPackGeneric, Annotation
-from forte.data.ontology.core import FList, FDict, Pointer
+from forte.data.ontology.core import FList, FDict
 from forte.pipeline import Pipeline
 from forte.processors.base import PackProcessor, MultiPackProcessor
 from ft.onto.base_ontology import EntityMention
@@ -49,6 +49,7 @@ class EntryWithList(Generics):
         self.entries = FList[ExampleEntry](self)
 
 
+@dataclass
 class EntryWithDict(Generics):
     """
     Test whether entries are stored correctly as a Dict using FDict.
@@ -163,7 +164,6 @@ class MultiEntryStructure(unittest.TestCase):
     def test_entry_attribute_mp_pointer(self):
         mpe: ExampleMPEntry = self.pack.get_single(ExampleMPEntry)
         self.assertIsInstance(mpe.refer_entry, ExampleEntry)
-        self.assertIsInstance(mpe.__dict__["refer_entry"], ExampleEntry)
 
         serialized_mp = self.pack.to_string(drop_record=True)
         recovered_mp = MultiPack.from_string(serialized_mp)
@@ -178,36 +178,15 @@ class MultiEntryStructure(unittest.TestCase):
         self.assertEqual(re_mpe.refer_entry.tid, mpe.refer_entry.tid)
         self.assertEqual(re_mpe.tid, mpe.tid)
 
-    def test_mp_pointer_with_version(self):
-        old_serialized_mp = """{"py/object": "forte.data.multi_pack.MultiPack", "py/state": {"_creation_records": {}, 
-        "_field_records": {}, "links": [], "groups": [], "_meta": {"py/object": "forte.data.multi_pack.MultiPackMeta",
-         "py/state": {"pack_name": "doc1", "_pack_id": 181242127422469546094667436428172965279, "record": {}}}, 
-         "_pack_ref": [339609801674405881625808524240847417793, 2921617025007791382061014912332775176], 
-         "_inverse_pack_ref": {"339609801674405881625808524240847417793": 0, "2921617025007791382061014912332775176": 1}, 
-         "_pack_names": ["pack1", "pack2"], "_name_index": {"pack1": 0, "pack2": 1}, "generics": [{"py/object": 
-         "entry_data_structures_test.ExampleMPEntry", "py/state": {"_tid": 47726154965183551280893968259456773646, 
-         "refer_entry": {"py/object": "forte.data.ontology.core.MpPointer", "py/state": 
-         {"_pack_index": 0, "_tid": 75914137358482571607300906707755792037}}}}], 
-         "_MultiPack__default_pack_prefix": "_pack"}}"""
+    def test_mp_pointer_serialization_schema(self):
+        serialized_mp = """{"_json_class": "forte.data.multi_pack.MultiPack", "_json_state": {"pack_version": "0.0.2", "_meta": {"_json_class": "forte.data.multi_pack.MultiPackMeta", "_json_state": {"pack_name": "doc1", "_pack_id": 110747467372205390166489939454487335581, "record": {}}}, "_pack_ref": [143667891708823045988051900980860741991, 55501035046014418523039697578490139411], "_inverse_pack_ref": {"143667891708823045988051900980860741991": 0, "55501035046014418523039697578490139411": 1}, "_pack_names": ["pack1", "pack2"], "_name_index": {"pack1": 0, "pack2": 1}, "_MultiPack__default_pack_prefix": "_pack", "_data_store": {"_json_class": "forte.data.data_store.DataStore", "_json_state": {"_onto_file_path": null, "_dynamically_add_type": true, "fields": {"forte.data.ontology.top.Generics": {}, "forte.data.ontology.top.Annotation": {}, "forte.data.ontology.top.Link": {}, "forte.data.ontology.top.Group": {}, "forte.data.ontology.top.MultiPackGeneric": {}, "forte.data.ontology.top.MultiPackLink": {}, "forte.data.ontology.top.MultiPackGroup": {}, "forte.data.ontology.top.Query": {}, "forte.data.ontology.top.AudioAnnotation": {}, "forte.data.ontology.top.ImageAnnotation": {}, "forte.data.ontology.top.Region": {}, "forte.data.ontology.top.Box": {}, "forte.data.ontology.top.Payload": {}, "entry_data_structures_test.EntryWithList": {"attributes": {"entries": {"index": 2}}}, "entry_data_structures_test.ExampleEntry": {"attributes": {"secret_number": {"index": 2}}}, "entry_data_structures_test.EntryWithDict": {"attributes": {"entries": {"index": 2}}}, "entry_data_structures_test.EntryAsAttribute": {"attributes": {}}, "entry_data_structures_test.ExampleMPEntry": {"attributes": {"refer_entry": {"index": 2}}}}, "entries": {"entry_data_structures_test.ExampleMPEntry": [[320142178160942898721019948733764450299, "entry_data_structures_test.ExampleMPEntry", [143667891708823045988051900980860741991, 264470699675371126293844966884005648796]]]}}}, "_creation_records": {}, "_field_records": {}}}"""
 
-        recovered_mp = MultiPack.from_string(old_serialized_mp)
-        from forte.version import DEFAULT_PACK_VERSION
-        self.assertEqual(recovered_mp.pack_version, DEFAULT_PACK_VERSION)
+        recovered_mp = MultiPack.from_string(serialized_mp)
 
-        s_packs: List[str] = ["""{"py/object": "forte.data.data_pack.DataPack", "py/state": {"_creation_records": {}, 
-        "_field_records": {}, "links": [], "groups": [], "_meta": {"py/object": "forte.data.data_pack.Meta", 
-        "py/state": {"pack_name": null, "_pack_id": 339609801674405881625808524240847417793, "record": {}, 
-        "language": "eng", "span_unit": "character", "info": {}}}, "_text": "", "annotations": [], "generics": 
-        [{"py/object": "entry_data_structures_test.ExampleEntry", "py/state": 
-        {"_tid": 75914137358482571607300906707755792037, "secret_number": 1}}], 
-        "_DataPack__replace_back_operations": [], "_DataPack__processed_original_spans": [], 
-        "_DataPack__orig_text_len": 0}}""", """{"py/object": "forte.data.data_pack.DataPack", "py/state": 
-        {"_creation_records": {}, "_field_records": {}, "links": [], "groups": [], "_meta": {"py/object": 
-        "forte.data.data_pack.Meta", "py/state": {"pack_name": null, "_pack_id": 2921617025007791382061014912332775176, 
-        "record": {}, "language": "eng", "span_unit": "character", "info": {}}}, "_text": "", "annotations": [], 
-        "generics": [{"py/object": "entry_data_structures_test.ExampleEntry", "py/state": 
-        {"_tid": 242133944929228462168174254535391188929}}], "_DataPack__replace_back_operations": [], 
-        "_DataPack__processed_original_spans": [], "_DataPack__orig_text_len": 0}}"""]
+        s_packs: List[str] = [
+            """{"_json_class": "forte.data.data_pack.DataPack", "_json_state": {"pack_version": "0.0.2", "_meta": {"_json_class": "forte.data.data_pack.Meta", "_json_state": {"pack_name": null, "_pack_id": 143667891708823045988051900980860741991, "record": {}, "language": "eng", "span_unit": "character", "sample_rate": null, "info": {}}}, "_data_store": {"_json_class": "forte.data.data_store.DataStore", "_json_state": {"_onto_file_path": null, "_dynamically_add_type": true, "fields": {"forte.data.ontology.top.Generics": {}, "forte.data.ontology.top.Annotation": {}, "forte.data.ontology.top.Link": {}, "forte.data.ontology.top.Group": {}, "forte.data.ontology.top.MultiPackGeneric": {}, "forte.data.ontology.top.MultiPackLink": {}, "forte.data.ontology.top.MultiPackGroup": {}, "forte.data.ontology.top.Query": {}, "forte.data.ontology.top.AudioAnnotation": {}, "forte.data.ontology.top.ImageAnnotation": {}, "forte.data.ontology.top.Region": {}, "forte.data.ontology.top.Box": {}, "forte.data.ontology.top.Payload": {}, "entry_data_structures_test.EntryWithList": {"attributes": {"entries": {"index": 2}}}, "entry_data_structures_test.ExampleEntry": {"attributes": {"secret_number": {"index": 2}}}, "entry_data_structures_test.EntryWithDict": {"attributes": {"entries": {"index": 2}}}, "entry_data_structures_test.EntryAsAttribute": {"attributes": {}}, "entry_data_structures_test.ExampleMPEntry": {"attributes": {"refer_entry": {"index": 2}}}}, "entries": {"entry_data_structures_test.ExampleEntry": [[264470699675371126293844966884005648796, "entry_data_structures_test.ExampleEntry", 1]]}}}, "text_payloads": [], "audio_payloads": [], "image_payloads": [], "_creation_records": {}, "_field_records": {}}}""",
+            """{"_json_class": "forte.data.data_pack.DataPack", "_json_state": {"pack_version": "0.0.2", "_meta": {"_json_class": "forte.data.data_pack.Meta", "_json_state": {"pack_name": null, "_pack_id": 55501035046014418523039697578490139411, "record": {}, "language": "eng", "span_unit": "character", "sample_rate": null, "info": {}}}, "_data_store": {"_json_class": "forte.data.data_store.DataStore", "_json_state": {"_onto_file_path": null, "_dynamically_add_type": true, "fields": {"forte.data.ontology.top.Generics": {}, "forte.data.ontology.top.Annotation": {}, "forte.data.ontology.top.Link": {}, "forte.data.ontology.top.Group": {}, "forte.data.ontology.top.MultiPackGeneric": {}, "forte.data.ontology.top.MultiPackLink": {}, "forte.data.ontology.top.MultiPackGroup": {}, "forte.data.ontology.top.Query": {}, "forte.data.ontology.top.AudioAnnotation": {}, "forte.data.ontology.top.ImageAnnotation": {}, "forte.data.ontology.top.Region": {}, "forte.data.ontology.top.Box": {}, "forte.data.ontology.top.Payload": {}, "entry_data_structures_test.EntryWithList": {"attributes": {"entries": {"index": 2}}}, "entry_data_structures_test.ExampleEntry": {"attributes": {"secret_number": {"index": 2}}}, "entry_data_structures_test.EntryWithDict": {"attributes": {"entries": {"index": 2}}}, "entry_data_structures_test.EntryAsAttribute": {"attributes": {}}, "entry_data_structures_test.ExampleMPEntry": {"attributes": {"refer_entry": {"index": 2}}}}, "entries": {"entry_data_structures_test.ExampleEntry": [[211693204381909586800582877426087499308, "entry_data_structures_test.ExampleEntry", null]]}}}, "text_payloads": [], "audio_payloads": [], "image_payloads": [], "_creation_records": {}, "_field_records": {}}}""",
+        ]
 
         recovered_packs = [DataPack.from_string(s) for s in s_packs]
 
@@ -265,7 +244,7 @@ class EntryDataStructure(unittest.TestCase):
 
         # Make sure we stored index instead of raw data in list.
         for v in list_entry.entries.__dict__["_FList__data"]:
-            self.assertIsInstance(v, Pointer)
+            self.assertIsInstance(v, int)
 
         # Make sure the recovered entry is also correct.
         pack_str = self.pack.to_string(True)
@@ -288,7 +267,7 @@ class EntryDataStructure(unittest.TestCase):
 
         # Make sure we stored index (pointers) instead of raw data in dict.
         for v in first_dict_entry.entries.__dict__["_FDict__data"].values():
-            self.assertTrue(isinstance(v, Pointer))
+            self.assertTrue(isinstance(v, int))
 
         # Make sure the recovered entry is also correct.
         pack_str = self.pack.to_string(True)
@@ -302,13 +281,18 @@ class EntryDataStructure(unittest.TestCase):
 
         self.assertEqual(recovered_first.entries, first_dict_entry.entries)
 
+    @unittest.skip(
+        "The test is skipped because the serialization/deserialization methods"
+        " of ``Entry`` is no longer invoked during ``DataPack.from_string()``."
+        " DataPack now relies on DataStore for storing entries."
+    )
     def test_entry_key_memories(self):
         pack = (
             Pipeline[MultiPack]()
-                .set_reader(EmptyReader())
-                .add(ChildEntryAnnotator())
-                .initialize()
-                .process(["pack1", "pack2"])
+            .set_reader(EmptyReader())
+            .add(ChildEntryAnnotator())
+            .initialize()
+            .process(["pack1", "pack2"])
         )
 
         DataPack.from_string(pack.to_string(True))
@@ -352,9 +336,11 @@ class NotHashingTest(unittest.TestCase):
         anno: Annotation = Annotation(self.pack, 0, 5)
         with self.assertRaises(TypeError):
             hash(anno)
-        anno.regret_creation()
 
         anno1: EntityMention = EntityMention(self.pack, 0, 2)
         with self.assertRaises(TypeError):
             hash(anno1)
-        anno1.regret_creation()
+
+
+if __name__ == "__main__":
+    unittest.main()

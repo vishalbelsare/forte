@@ -33,10 +33,10 @@ from forte.processors.data_augment.algorithms.base_data_augmentation_op import (
     BaseDataAugmentationOp,
 )
 
-__all__ = ["BaseOpProcessor"]
+__all__ = ["DataAugProcessor"]
 
 
-class BaseOpProcessor(MultiPackProcessor):
+class DataAugProcessor(MultiPackProcessor):
     r"""
     This is a Base Data Augmentation Op Processor that instantiates
     data augmentation ops into Forte Data Structures to be used. It can
@@ -70,7 +70,7 @@ class BaseOpProcessor(MultiPackProcessor):
         # :attr:`replacement_op`: BaseAugmentationOp
         # It is the augmentation Op used by this processor
         # instance.
-        self.replacement_op: BaseDataAugmentationOp = None
+        self.replacement_op: BaseDataAugmentationOp
 
         self.configs = None
 
@@ -203,9 +203,8 @@ class BaseOpProcessor(MultiPackProcessor):
 
         if not success:
             raise ValueError(
-                "There was a problem encountered when performing the augmentation in {}".format(
-                    self.configs["data_aug_op"]
-                )
+                f"There was a problem encountered when performing the "
+                f"augmentation in {self.configs['data_aug_op']}."
             )
 
         new_packs: List[Tuple[str, DataPack]] = []

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from enum import IntEnum
 import logging
 from pathlib import Path
 from typing import (
@@ -26,16 +27,19 @@ from typing import (
     Set,
     Callable,
     Tuple,
+    cast,
 )
 
 import numpy as np
 from sortedcontainers import SortedList
-
 from forte.common.exception import (
     ProcessExecutionException,
     UnknownOntologyClassException,
 )
+from forte.common.constants import TID_INDEX, BEGIN_ATTR_NAME, END_ATTR_NAME
 from forte.data import data_utils_io
+from forte.data.data_store import DataStore
+from forte.data.entry_converter import EntryConverter
 from forte.data.base_pack import BaseMeta, BasePack
 from forte.data.index import BaseIndex
 from forte.data.ontology.core import Entry
@@ -44,13 +48,20 @@ from forte.data.ontology.top import (
     Annotation,
     Link,
     Group,
-    SinglePackEntries,
     Generics,
     AudioAnnotation,
+    Payload,
+    AudioPayload,
+    TextPayload,
+    ImagePayload,
+    SinglePackEntries,
+    AnnotationLikeEntries,
 )
+
+from forte.data.modality import Modality
 from forte.data.span import Span
 from forte.data.types import ReplaceOperationsType, DataRequest
-from forte.utils import get_class
+from forte.utils import get_class, get_full_module_name
 
 logger = logging.getLogger(__name__)
 
@@ -157,90 +168,42 @@ class DataPack(BasePack[Entry, Link, Group]):
 
     def __init__(self, pack_name: Optional[str] = None):
         super().__init__(pack_name)
-        self._text = ""
-        self._audio: Optional[np.ndarray] = None
 
-        self.annotations: SortedList[Annotation] = SortedList()
-        self.links: SortedList[Link] = SortedList()
-        self.groups: SortedList[Group] = SortedList()
-        self.generics: SortedList[Generics] = SortedList()
-        self.audio_annotations: SortedList[AudioAnnotation] = SortedList()
+        self._data_store: DataStore = DataStore()
+        self._entry_converter: EntryConverter = EntryConverter()
 
-        self.__replace_back_operations: ReplaceOperationsType = []
-        self.__processed_original_spans: List[Tuple[Span, Span]] = []
-
-        self.__orig_text_len: int = 0
+        self.text_payloads: List[Payload] = []
+        self.audio_payloads: List[Payload] = []
+        self.image_payloads: List[Payload] = []
 
         self._index: DataIndex = DataIndex()
 
     def __getstate__(self):
         r"""
         In serialization,
-            1) will serialize the annotation sorted list as a normal list;
-            2) will not serialize the indices
+            1) will remove ``_entry_converter`` to save space.
         """
         state = super().__getstate__()
-        state["annotations"] = list(state["annotations"])
-        state["links"] = list(state["links"])
-        state["groups"] = list(state["groups"])
-        state["generics"] = list(state["generics"])
-        state["audio_annotations"] = list(state["audio_annotations"])
+        state.pop("_entry_converter")
         return state
 
     def __setstate__(self, state):
         r"""
         In deserialization, we
-            1) transform the annotation list back to a sorted list;
-            2) initialize the indexes.
-            3) Obtain the pack ids.
+            1) Perform pack version compatibility checking;
+            2) initialize the entry converter
+            3) initialize the indexes.
+            4) Obtain the pack ids.
         """
+        self._entry_converter = EntryConverter()
         super().__setstate__(state)
-
-        # For backward compatibility.
-        if "replace_back_operations" in self.__dict__:
-            self.__replace_back_operations = self.__dict__.pop(
-                "replace_back_operations"
-            )
-        if "processed_original_spans" in self.__dict__:
-            self.__processed_original_spans = self.__dict__.pop(
-                "processed_original_spans"
-            )
-        if "orig_text_len" in self.__dict__:
-            self.__orig_text_len = self.__dict__.pop("orig_text_len")
-
-        self.annotations = as_sorted_error_check(self.annotations)
-        self.links = as_sorted_error_check(self.links)
-        self.groups = as_sorted_error_check(self.groups)
-        self.generics = as_sorted_error_check(self.generics)
-
-        # Add `hasattr` checking here for backward compatibility
-        self.audio_annotations = (
-            as_sorted_error_check(self.audio_annotations)
-            if hasattr(self, "audio_annotations")
-            else SortedList()
-        )
+        for payload in (
+            self.text_payloads + self.audio_payloads + self.image_payloads
+        ):
+            payload.set_pack(self)
 
         self._index = DataIndex()
-        self._index.update_basic_index(list(self.annotations))
-        self._index.update_basic_index(list(self.links))
-        self._index.update_basic_index(list(self.groups))
-        self._index.update_basic_index(list(self.generics))
-        self._index.update_basic_index(list(self.audio_annotations))
-
-        for a in self.annotations:
-            a.set_pack(self)
-
-        for a in self.links:
-            a.set_pack(self)
-
-        for a in self.groups:
-            a.set_pack(self)
-
-        for a in self.generics:
-            a.set_pack(self)
-
-        for a in self.audio_annotations:
-            a.set_pack(self)
+        self._index.update_basic_index(list(iter(self)))
 
     def __iter__(self):
         yield from self.annotations
@@ -257,18 +220,51 @@ class DataPack(BasePack[Entry, Link, Group]):
 
     @property
     def text(self) -> str:
-        r"""Return the text of the data pack"""
-        return self._text
+        """
+        Get the first text data stored in the DataPack.
+        If there is no text payload in the DataPack, it will return empty
+        string.
+
+        Args:
+            text_payload_index: the index of the text payload. Defaults to 0.
+
+        Raises:
+            ValueError: raised when the index is out of bound of the text
+                payload list.
+
+        Returns:
+            text data in the text payload.
+        """
+        if len(self.text_payloads) > 0:
+            return str(self.get_payload_data_at(Modality.Text, 0))
+        else:
+            return ""
 
     @property
-    def audio(self) -> Optional[np.ndarray]:
-        r"""Return the audio of the data pack"""
-        return self._audio
+    def audio(self):
+        r"""
+        Return the audio data from the first audio payload in the DataPack.
+        """
+        return self.get_payload_data_at(Modality.Audio, 0)
 
     @property
-    def sample_rate(self) -> Optional[int]:
-        r"""Return the sample rate of the audio data"""
-        return getattr(self._meta, "sample_rate")
+    def image(self):
+        r"""
+        Return the image data from the first image payload in the data pack.
+        """
+        return self.get_image(0)
+
+    def get_image(self, index: int):
+        """
+        Return the image data from the image payload at the specified index.
+
+        Args:
+            index: image payload index for retrieving the image data.
+
+        Returns:
+            image payload data at the specified index.
+        """
+        return self.get_payload_data_at(Modality.Image, index)
 
     @property
     def all_annotations(self) -> Iterator[Annotation]:
@@ -279,7 +275,10 @@ class DataPack(BasePack[Entry, Link, Group]):
         type :class:`~forte.data.ontology.top.Annotation`.
 
         """
-        yield from self.annotations
+        for entry in self._data_store.all_entries(
+            "forte.data.ontology.top.Annotation"
+        ):
+            yield self.get_entry(tid=entry[TID_INDEX])  # type: ignore
 
     @property
     def num_annotations(self) -> int:
@@ -289,7 +288,9 @@ class DataPack(BasePack[Entry, Link, Group]):
         Returns: (int) Number of the links.
 
         """
-        return len(self.annotations)
+        return self._data_store.num_entries(
+            "forte.data.ontology.top.Annotation"
+        )
 
     @property
     def all_links(self) -> Iterator[Link]:
@@ -300,7 +301,10 @@ class DataPack(BasePack[Entry, Link, Group]):
         type :class:`~forte.data.ontology.top.Link`.
 
         """
-        yield from self.links
+        for entry in self._data_store.all_entries(
+            "forte.data.ontology.top.Link"
+        ):
+            yield self.get_entry(tid=entry[TID_INDEX])  # type: ignore
 
     @property
     def num_links(self) -> int:
@@ -310,7 +314,7 @@ class DataPack(BasePack[Entry, Link, Group]):
         Returns: Number of the links.
 
         """
-        return len(self.links)
+        return self._data_store.num_entries("forte.data.ontology.top.Link")
 
     @property
     def all_groups(self) -> Iterator[Group]:
@@ -321,7 +325,10 @@ class DataPack(BasePack[Entry, Link, Group]):
         type :class:`~forte.data.ontology.top.Group`.
 
         """
-        yield from self.groups
+        for entry in self._data_store.all_entries(
+            "forte.data.ontology.top.Group"
+        ):
+            yield self.get_entry(tid=entry[TID_INDEX])  # type: ignore
 
     @property
     def num_groups(self):
@@ -331,7 +338,7 @@ class DataPack(BasePack[Entry, Link, Group]):
         Returns: Number of groups.
 
         """
-        return len(self.groups)
+        return self._data_store.num_entries("forte.data.ontology.top.Group")
 
     @property
     def all_generic_entries(self) -> Iterator[Generics]:
@@ -341,7 +348,10 @@ class DataPack(BasePack[Entry, Link, Group]):
         Returns: Iterator of generic
 
         """
-        yield from self.generics
+        for entry in self._data_store.all_entries(
+            "forte.data.ontology.top.Generics"
+        ):
+            yield self.get_entry(tid=entry[TID_INDEX])  # type: ignore
 
     @property
     def num_generics_entries(self):
@@ -351,7 +361,7 @@ class DataPack(BasePack[Entry, Link, Group]):
         Returns: Number of generics entries.
 
         """
-        return len(self.generics)
+        return self._data_store.num_entries("forte.data.ontology.top.Generics")
 
     @property
     def all_audio_annotations(self) -> Iterator[AudioAnnotation]:
@@ -362,7 +372,10 @@ class DataPack(BasePack[Entry, Link, Group]):
         type :class:`~forte.data.ontology.top.AudioAnnotation`.
 
         """
-        yield from self.audio_annotations
+        for entry in self._data_store.all_entries(
+            "forte.data.ontology.top.AudioAnnotation"
+        ):
+            yield self.get_entry(tid=entry[TID_INDEX])  # type: ignore
 
     @property
     def num_audio_annotations(self):
@@ -372,21 +385,159 @@ class DataPack(BasePack[Entry, Link, Group]):
         Returns: Number of audio annotations.
 
         """
-        return len(self.audio_annotations)
+        return self._data_store.num_entries(
+            "forte.data.ontology.top.AudioAnnotation"
+        )
 
-    def get_span_text(self, begin: int, end: int) -> str:
+    @property
+    def annotations(self):
+        """
+        A SortedList container of all annotations in this data pack.
+
+        Returns: SortedList of all annotations, of
+        type :class:`~forte.data.ontology.top.Annotation`.
+
+        """
+        return SortedList(self.all_annotations)
+
+    @property
+    def generics(self):
+        """
+        A SortedList container of all generic entries in this data pack.
+
+        Returns: SortedList of generics
+
+        """
+        return SortedList(self.all_generic_entries)
+
+    @property
+    def audio_annotations(self):
+        """
+        A SortedList container of all audio annotations in this data pack.
+
+        Returns: SortedList of all audio annotations, of
+        type :class:`~forte.data.ontology.top.AudioAnnotation`.
+
+        """
+        return SortedList(self.all_audio_annotations)
+
+    @property
+    def links(self):
+        """
+        A List container of all links in this data pack.
+
+        Returns: List of all links, of
+        type :class:`~forte.data.ontology.top.Link`.
+
+        """
+        return SortedList(self.all_links)
+
+    @property
+    def groups(self):
+        """
+        A List container of all groups in this data pack.
+
+        Returns: List of all groups, of
+        type :class:`~forte.data.ontology.top.Group`.
+
+        """
+        return SortedList(self.all_groups)
+
+    @groups.setter
+    def groups(self, val):
+        self._groups = val
+
+    def get_payload_at(
+        self, modality: IntEnum, payload_index: int
+    ):  # -> Union[TextPayload, AudioPayload, ImagePayload]:
+        """
+        Get Payload of requested modality at the requested payload index.
+
+        Args:
+            modality: data modality among "text", "audio", "image"
+            payload_index: the zero-based index of the Payload
+                in this DataPack's Payload entries of the requested modality.
+
+        Raises:
+            ValueError: raised when the requested modality is not supported.
+
+        Returns:
+            Payload entry containing text data, image or audio data.
+
+        """
+        supported_modality = [enum.name for enum in Modality]
+
+        payloads_length = -1
+        try:
+            if modality == Modality.Text:
+                payloads_length = len(self.text_payloads)
+                payload = self.text_payloads[payload_index]
+            elif modality == Modality.Audio:
+                payloads_length = len(self.audio_payloads)
+                payload = self.audio_payloads[payload_index]
+            elif modality == Modality.Image:
+                payloads_length = len(self.image_payloads)
+                payload = self.image_payloads[payload_index]
+            else:
+                raise ValueError(
+                    f"Provided modality {modality.name} is not supported."
+                    "Please provide one of modality among"
+                    f" {supported_modality}."
+                )
+        except IndexError as e:
+            raise ProcessExecutionException(
+                f"payload index ({payload_index}) "
+                f"is larger or equal to {modality.name} payload list"
+                f" length ({payloads_length}). "
+                f"Please input a {modality.name} payload index less than it."
+            ) from e
+        return payload
+
+    def get_payload_data_at(
+        self, modality: IntEnum, payload_index: int
+    ) -> Union[str, np.ndarray]:
+        """
+        Get Payload of requested modality at the requested payload index.
+
+        Args:
+            modality: data modality among "text", "audio", "image"
+            payload_index: the zero-based index of the Payload
+                in this DataPack's Payload entries of the requested modality.
+
+        Raises:
+            ValueError: raised when the requested modality is not supported.
+
+        Returns:
+            different data types for different data modalities.
+
+            1. str data for text data.
+
+            2. Numpy array for image and audio data.
+
+        """
+        return self.get_payload_at(modality, payload_index).cache
+
+    def get_span_text(
+        self, begin: int, end: int, text_payload_index: int = 0
+    ) -> str:
         r"""Get the text in the data pack contained in the span.
 
         Args:
             begin: begin index to query.
             end: end index to query.
+            text_payload_index: the zero-based index of the TextPayload
+                in this DataPack's TextPayload entries. Defaults to 0.
 
         Returns:
             The text within this span.
         """
-        return self._text[begin:end]
+        return cast(
+            str, self.get_payload_data_at(Modality.Text, text_payload_index)
+        )[begin:end]
 
-    def get_span_audio(self, begin: int, end: int) -> np.ndarray:
+    def get_span_audio(
+        self, begin: int, end: int, audio_payload_index=0
+    ) -> np.ndarray:
         r"""Get the audio in the data pack contained in the span.
         `begin` and `end` represent the starting and ending indices of the span
         in audio payload respectively. Each index corresponds to one sample in
@@ -395,65 +546,188 @@ class DataPack(BasePack[Entry, Link, Group]):
         Args:
             begin: begin index to query.
             end: end index to query.
+            audio_payload_index: the zero-based index of the AudioPayload
+                in this DataPack's AudioPayload entries. Defaults to 0.
 
         Returns:
             The audio within this span.
         """
-        if self._audio is None:
-            raise ProcessExecutionException(
-                "The audio payload of this DataPack is not set. Please call"
-                " method `set_audio` before running `get_span_audio`."
-            )
-        return self._audio[begin:end]
+        return cast(
+            np.ndarray,
+            self.get_payload_data_at(Modality.Audio, audio_payload_index)[
+                begin:end
+            ],
+        )
+
+    def add_text(self, text):
+        """
+        Add a text payload to this data pack.
+
+        Args:
+            text: Text to be added.
+        """
+        ip = TextPayload(self)
+        ip.cache = text
 
     def set_text(
         self,
         text: str,
         replace_func: Optional[Callable[[str], ReplaceOperationsType]] = None,
+        text_payload_index: int = 0,
     ):
+        """
+        Set text for TextPayload at a specified index or add a new TextPayload
+        in the DataPack.
 
-        if len(text) < len(self._text):
-            raise ProcessExecutionException(
-                "The new text is overwriting the original one with shorter "
-                "length, which might cause unexpected behavior."
-            )
+        Raises:
+            ValueError: raised when the text payload index is out of range.
 
-        if len(self._text):
-            logging.warning(
-                "Need to be cautious when changing the text of a "
-                "data pack, existing entries may get affected. "
-            )
+        Args:
+            text: the input text to be assigned to this pack.
+            replace_func: function that replace text. Defaults to None.
+            text_payload_index: the zero-based index of to locate a TextPayload
+                in this DataPack, default 0. This allows one to set multiple texts
+                per DataPack. A DataPack by default contains one such TextPayload,
+                if the `text_payload_index` is larger than 0, then
+                more than one TextPayload need to be added before this, otherwise
 
+        """
         span_ops = [] if replace_func is None else replace_func(text)
-
         # The spans should be mutually exclusive
         (
-            self._text,
-            self.__replace_back_operations,
-            self.__processed_original_spans,
-            self.__orig_text_len,
+            text,
+            replace_back_operations,
+            processed_original_spans,
+            orig_text_len,
         ) = data_utils_io.modify_text_and_track_ops(text, span_ops)
 
-    def set_audio(self, audio: np.ndarray, sample_rate: int):
-        r"""Set the audio payload and sample rate of the :class:`~forte.data.data_pack.DataPack`
-        object.
+        # temporary solution for backward compatibility
+        # past API use this method to add a single text in the datapack
+        if (
+            self._data_store.num_entries("forte.data.ontology.top.TextPayload")
+            == 0
+            and text_payload_index == 0
+        ):
+            # Create a new TextPayload.
+            tp = TextPayload(self)
+        else:
+            tp = self.get_payload_at(Modality.Text, text_payload_index)
+
+        tp.cache = text
+
+        tp.replace_back_operations = replace_back_operations
+        tp.processed_original_spans = processed_original_spans
+        tp.orig_text_len = orig_text_len
+
+    def set_audio(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        audio_payload_index: int = 0,
+    ):
+        r"""
+        Set audio for AudioPayload at a specified index or add a new AudioPayload in the DataPack.
+
+        Raises:
+            ValueError: raised when the audio payload index is out of range.
 
         Args:
             audio: A numpy array storing the audio waveform.
             sample_rate: An integer specifying the sample rate.
+            audio_payload_index: the zero-based index of the AudioPayload
+                in this DataPack's AudioPayload entries. Defaults to 0, and
+                it adds a new audio payload if there is no audio payload in the data pack.
         """
-        self._audio = audio
-        self.set_meta(sample_rate=sample_rate)
+        # temporary solution for backward compatibility
+        # past API use this method to add a single audio in the datapack
+        if (
+            self._data_store.num_entries("forte.data.ontology.top.AudioPayload")
+            == 0
+            and audio_payload_index == 0
+        ):
+            logging.warning(
+                "audio_payload_index is set to zero,"
+                "and there is not existing AudioPayload"
+                " in the DataPack."
+                "An `AudioPayload` will be added into the DataPack."
+                "However, we encourage user to"
+                " use DataPack.add_audio() function instead."
+            )
+            ap = AudioPayload(self)
+        else:
+            ap = self.get_payload_at(Modality.Audio, audio_payload_index)
 
-    def get_original_text(self):
+        ap.cache = audio
+        ap.sample_rate = sample_rate
+
+    def add_audio(self, audio):
+        r"""
+        Add an AudioPayload storing the audio given in the parameters.
+
+        Args:
+            audio: A numpy array storing the audio.
+        """
+
+        ip = AudioPayload(self)
+        ip.cache = audio
+
+    def add_image(self, image):
+        r"""
+        Add an ImagePayload storing the image given in the parameters.
+
+        Args:
+            image: A numpy array storing the image.
+        """
+        ip = ImagePayload(self)
+        ip.cache = image
+
+    def set_image(
+        self,
+        image,
+        image_payload_index: int = 0,
+    ):
+        r"""Set the image payload of the :class:`~forte.data.data_pack.DataPack`
+        object.
+
+        Args:
+            image: A numpy array storing the image.
+            image_payload_index: the zero-based index of the ImagePayload
+                in this DataPack's ImagePayload entries. Defaults to 0.
+        """
+        # temporary solution for backward compatibility
+        # past API use this method to add a single image in the datapack
+        if (
+            self._data_store.num_entries("forte.data.ontology.top.ImagePayload")
+            == 0
+            and image_payload_index == 0
+        ):
+            ip = ImagePayload(self)
+            logging.warning(
+                "image_payload_index is set to zero,"
+                "and there is not existing ImagePayload"
+                " in the DataPack."
+                "An `ImagePayload` will be added into the DataPack."
+                "However, we encourage user to"
+                " use DataPack.add_image() function instead."
+            )
+        else:
+            ip = self.get_payload_at(Modality.Image, image_payload_index)
+        ip.cache = image
+
+    def get_original_text(self, text_payload_index: int = 0):
         r"""Get original unmodified text from the :class:`~forte.data.data_pack.DataPack` object.
+
+        Args:
+            text_payload_index: the zero-based index of the TextPayload
+                in this DataPack's  entries. Defaults to 0.
 
         Returns:
             Original text after applying the `replace_back_operations` of
             :class:`~forte.data.data_pack.DataPack` object to the modified text
         """
+        tp = self.get_payload_at(Modality.Text, text_payload_index)
         original_text, _, _, _ = data_utils_io.modify_text_and_track_ops(
-            self._text, self.__replace_back_operations
+            tp.cache, tp.replace_back_operations
         )
         return original_text
 
@@ -533,16 +807,19 @@ class DataPack(BasePack[Entry, Link, Group]):
             Returns:
                 Original index that aligns with input_index
             """
-            if len(self.__processed_original_spans) == 0:
+            processed_original_spans = self.get_payload_at(
+                Modality.Text, 0
+            ).processed_original_spans
+            if len(processed_original_spans) == 0:
                 return input_index
 
-            len_processed_text = len(self._text)
+            len_processed_text = len(self.text)
             orig_index = None
             prev_end = 0
             for (
                 inverse_span,
                 original_span,
-            ) in self.__processed_original_spans:
+            ) in processed_original_spans:
                 # check if the input_index lies between one of the unprocessed
                 # spans
                 if prev_end <= input_index < inverse_span.begin:
@@ -571,9 +848,7 @@ class DataPack(BasePack[Entry, Link, Group]):
             if orig_index is None:
                 # check if the input_index lies between the last unprocessed
                 # span
-                inverse_span, original_span = self.__processed_original_spans[
-                    -1
-                ]
+                inverse_span, original_span = processed_original_spans[-1]
                 if inverse_span.end <= input_index < len_processed_text:
                     increment = original_span.end - inverse_span.end
                     orig_index = input_index + increment
@@ -596,7 +871,7 @@ class DataPack(BasePack[Entry, Link, Group]):
     def deserialize(
         cls,
         data_source: Union[Path, str],
-        serialize_method: str = "jsonpickle",
+        serialize_method: str = "json",
         zip_pack: bool = False,
     ) -> "DataPack":
         """
@@ -608,17 +883,17 @@ class DataPack(BasePack[Entry, Link, Group]):
             data_source: The path storing data source.
             serialize_method: The method used to serialize the data, this
               should be the same as how serialization is done. The current
-              options are `jsonpickle` and `pickle`. The default method
-              is `jsonpickle`.
+              options are `json`, `jsonpickle` and `pickle`. The default method
+              is `json`.
             zip_pack: Boolean value indicating whether the input source is
               zipped.
 
         Returns:
             An data pack object deserialized from the string.
         """
-        return cls._deserialize(data_source, serialize_method, zip_pack)
+        return cls._deserialize(data_source, serialize_method, zip_pack)  # type: ignore
 
-    def _add_entry(self, entry: EntryType) -> EntryType:
+    def _add_entry(self, entry: Union[EntryType, int]) -> EntryType:
         r"""Force add an :class:`~forte.data.ontology.core.Entry` object to the
         :class:`~forte.data.data_pack.DataPack` object. Allow duplicate entries in a pack.
 
@@ -629,30 +904,29 @@ class DataPack(BasePack[Entry, Link, Group]):
         Returns:
             The input entry itself
         """
-        return self.__add_entry_with_check(entry, True)
+        return self.__add_entry_with_check(entry)
 
-    def __add_entry_with_check(
-        self, entry: EntryType, allow_duplicate: bool = True
-    ) -> EntryType:
+    def __add_entry_with_check(self, entry: Union[EntryType, int]) -> EntryType:
         r"""Internal method to add an :class:`~forte.data.ontology.core.Entry`
         object to the :class:`~forte.data.DataPack` object.
 
         Args:
             entry: An :class:`~forte.data.ontology.core.Entry` object
                 to be added to the datapack.
-            allow_duplicate: Whether we allow duplicate in the datapack.
 
         Returns:
             The input entry itself
         """
-        if isinstance(entry, Annotation):
-            target = self.annotations
+        if isinstance(entry, int):
+            # If entry is a TID, convert it to the class object.
+            entry = self._entry_converter.get_entry_object(tid=entry, pack=self)  # type: ignore
 
+        if isinstance(entry, Annotation):
             begin, end = entry.begin, entry.end
 
             if begin < 0:
                 raise ValueError(
-                    f"The begin {begin} is smaller than 0, this"
+                    f"The begin {begin} is smaller than 0, this "
                     f"is not a valid begin."
                 )
 
@@ -674,37 +948,15 @@ class DataPack(BasePack[Entry, Link, Group]):
                         f"at [{begin}:{end}], in pack {pack_ref}."
                     )
 
-        elif isinstance(entry, Link):
-            target = self.links
-        elif isinstance(entry, Group):
-            target = self.groups
-        elif isinstance(entry, Generics):
-            target = self.generics
-        elif isinstance(entry, AudioAnnotation):
-            target = self.audio_annotations
-        else:
-            raise ValueError(
-                f"Invalid entry type {type(entry)}. A valid entry "
-                f"should be an instance of Annotation, Link, Group, Generics "
-                "or AudioAnnotation."
-            )
-
-        if not allow_duplicate:
-            index = target.index(entry)
-            if index < 0:
-                # Return the existing entry if duplicate is not allowed.
-                return target[index]
-
-        target.add(entry)
         # update the data pack index if needed
-        self._index.update_basic_index([entry])
+        self._index.update_basic_index([entry])  # type: ignore
         if self._index.link_index_on and isinstance(entry, Link):
             self._index.update_link_index([entry])
         if self._index.group_index_on and isinstance(entry, Group):
             self._index.update_group_index([entry])
         self._index.deactivate_coverage_index()
-        self._pending_entries.pop(entry.tid)
-        return entry
+        self._pending_entries.pop(entry.tid)  # type: ignore
+        return entry  # type: ignore
 
     def delete_entry(self, entry: EntryType):
         r"""Delete an :class:`~forte.data.ontology.core.Entry` object from the
@@ -720,46 +972,7 @@ class DataPack(BasePack[Entry, Link, Group]):
                 object to be deleted from the pack.
 
         """
-        if isinstance(entry, Annotation):
-            target = self.annotations
-        elif isinstance(entry, Link):
-            target = self.links
-        elif isinstance(entry, Group):
-            target = self.groups
-        elif isinstance(entry, Generics):
-            target = self.generics
-        elif isinstance(entry, AudioAnnotation):
-            target = self.audio_annotations
-        else:
-            raise ValueError(
-                f"Invalid entry type {type(entry)}. A valid entry "
-                f"should be an instance of Annotation, Link, or Group."
-            )
-
-        begin: int = target.bisect_left(entry)
-
-        index_to_remove = -1
-        for i, e in enumerate(target[begin:]):
-            if e.tid == entry.tid:
-                index_to_remove = begin + i
-                break
-
-        if index_to_remove < 0:
-            logger.warning(
-                "The entry with id %d that you are trying to removed "
-                "does not exists in the data pack's index. Probably it is "
-                "created but not added in the first place.",
-                entry.tid,
-            )
-        else:
-            target.pop(index_to_remove)
-
-        # update basic index
-        self._index.remove_entry(entry)
-
-        # set other index invalid
-        self._index.turn_link_index_switch(on=False)
-        self._index.turn_group_index_switch(on=False)
+        super().delete_entry(entry=entry)
         self._index.deactivate_coverage_index()
 
     @classmethod
@@ -775,6 +988,7 @@ class DataPack(BasePack[Entry, Link, Group]):
         context_type: Union[str, Type[Annotation], Type[AudioAnnotation]],
         request: Optional[DataRequest] = None,
         skip_k: int = 0,
+        payload_index: int = 0,
     ) -> Iterator[Dict[str, Any]]:
         r"""Fetch data from entries in the data_pack of type
         `context_type`. Data includes `"span"`, annotation-specific
@@ -849,6 +1063,9 @@ class DataPack(BasePack[Entry, Link, Group]):
                 returned by default.
             skip_k: Will skip the first `skip_k` instances and generate
                 data from the (`offset` + 1)th instance.
+            payload_index: the zero-based index of the Payload
+                in this DataPack's Payload entries of a particular modality.
+                The modality is dependent on ``context_type``. Defaults to 0.
 
         Returns:
             A data generator, which generates one piece of data (a dict
@@ -937,9 +1154,13 @@ class DataPack(BasePack[Entry, Link, Group]):
                     " [Annotation, AudioAnnotation]."
                 )
 
-        def get_context_data(c_type, context):
-            r"""Get context-specific data of a given context type and
-                context.
+        def get_context_data(
+            c_type: Union[Type[Annotation], Type[AudioAnnotation]],
+            context: Union[Annotation, AudioAnnotation],
+            payload_index: int,
+        ):
+            r"""
+            Get context-specific data of a given context type and context.
 
             Args:
                 c_type:
@@ -947,6 +1168,9 @@ class DataPack(BasePack[Entry, Link, Group]):
                     could be any :class:`~forte.data.ontology.top.Annotation` type.
                 context: context that
                     contains data to be extracted.
+                payload_index: the zero-based index of the Payload
+                    in this DataPack's Payload entries of a particular modality.
+                    The modality is dependent on ``c_type``.
 
             Raises:
                 NotImplementedError: raised when the given context type is
@@ -956,9 +1180,13 @@ class DataPack(BasePack[Entry, Link, Group]):
                 str: context data.
             """
             if issubclass(c_type, Annotation):
-                return self.text[context.begin : context.end]
+                return self.get_payload_data_at(Modality.Text, payload_index)[
+                    context.begin : context.end
+                ]
             elif issubclass(c_type, AudioAnnotation):
-                return self.audio[context.begin : context.end]
+                return self.get_payload_data_at(Modality.Audio, payload_index)[
+                    context.begin : context.end
+                ]
             else:
                 raise NotImplementedError(
                     f"Context type is set to {context_type}"
@@ -976,7 +1204,9 @@ class DataPack(BasePack[Entry, Link, Group]):
                 skipped += 1
                 continue
             data: Dict[str, Any] = {}
-            data["context"] = get_context_data(context_type_, context)
+            data["context"] = get_context_data(
+                context_type_, context, payload_index
+            )
             data["offset"] = context.begin
 
             for field in context_fields:
@@ -1250,110 +1480,15 @@ class DataPack(BasePack[Entry, Link, Group]):
             self, context_entry, covered_entry.__class__
         )
 
-    def iter_in_range(
-        self,
-        entry_type: Type[EntryType],
-        range_annotation: Union[Annotation, AudioAnnotation],
-    ) -> Iterator[EntryType]:
-        """
-        Iterate the entries of the provided type within or fulfill the
-        constraints of the `range_annotation`. The constraint is True if
-        an entry is :meth:`~forte.data.data_pack.DataIndex.in_span` or
-        :meth:`~forte.data.data_pack.DataIndex.in_audio_span` of the provided
-        `range_annotation`.
-
-        Internally, if the coverage index between the entry type and the
-        type of the `range_annotation` is built, then this will create the
-        iterator from the index. Otherwise, the function will iterate them
-        from scratch (which is slower). If there are frequent usage of this
-        function, it is suggested to build the coverage index.
-
-        Only when `range_annotation` is an instance of `AudioAnnotation` will
-        the searching be performed on the list of audio annotations. In other
-        cases (i.e., when `range_annotation` is None or Annotation), it defaults
-        to a searching process on the list of text annotations.
-
-        Args:
-            entry_type: The type of entry to iterate over.
-            range_annotation: The range annotation that serve as the constraint.
-
-        Returns:
-            An iterator of the entries with in the `range_annotation`.
-
-        """
-        use_coverage = self._index.coverage_index_is_valid
-        coverage_index: Optional[Dict[int, Set[int]]] = {}
-
-        if use_coverage:
-            coverage_index = self._index.coverage_index(
-                type(range_annotation), entry_type
-            )
-            if coverage_index is None:
-                use_coverage = False
-
-        def get_bisect_range(entry_class, search_list: SortedList):
-            """
-            Perform binary search on the specified list for target entry class.
-
-            Args:
-                entry_class: Target type of entry. It can be Annotation or
-                    `AudioAnnotation`.
-                search_list: A `SortedList` object on which the binary search
-                    will be carried out.
-            """
-            range_begin = range_annotation.begin if range_annotation else 0
-            range_end = (
-                range_annotation.end
-                if range_annotation
-                else search_list[-1].end
-            )
-
-            temp_begin = entry_class(self, range_begin, range_begin)
-            begin_index = search_list.bisect(temp_begin)
-
-            temp_end = entry_class(self, range_end, range_end)
-            end_index = search_list.bisect(temp_end)
-
-            # Make sure these temporary annotations are not part of the
-            # actual data.
-            temp_begin.regret_creation()
-            temp_end.regret_creation()
-            return search_list[begin_index:end_index]
-
-        if use_coverage and coverage_index is not None:
-            for tid in coverage_index[range_annotation.tid]:
-                yield self.get_entry(tid)  # type: ignore
-        elif isinstance(range_annotation, AudioAnnotation):
-            if issubclass(entry_type, AudioAnnotation):
-                yield from get_bisect_range(
-                    AudioAnnotation, self.audio_annotations
-                )
-            elif issubclass(entry_type, Link):
-                for link in self.links:
-                    if self._index.in_audio_span(link, range_annotation.span):
-                        yield link
-            elif issubclass(entry_type, Group):
-                for group in self.groups:
-                    if self._index.in_audio_span(group, range_annotation.span):
-                        yield group
-        else:
-            if issubclass(entry_type, Annotation):
-                yield from get_bisect_range(Annotation, self.annotations)
-            elif issubclass(entry_type, Link):
-                for link in self.links:
-                    if self._index.in_span(link, range_annotation.span):
-                        yield link
-            elif issubclass(entry_type, Group):
-                for group in self.groups:
-                    if self._index.in_span(group, range_annotation.span):
-                        yield group
-
     def get(  # type: ignore
         self,
         entry_type: Union[str, Type[EntryType]],
-        range_annotation: Optional[Union[Annotation, AudioAnnotation]] = None,
+        range_annotation: Optional[
+            Union[Annotation, AudioAnnotation, int]
+        ] = None,
         components: Optional[Union[str, Iterable[str]]] = None,
         include_sub_type: bool = True,
+        get_raw: bool = False,
     ) -> Iterable[EntryType]:
         r"""This function is used to get data from a data pack with various
         methods.
@@ -1419,38 +1554,59 @@ class DataPack(BasePack[Entry, Link, Group]):
         Args:
             entry_type: The type of entries requested.
             range_annotation: The
-                range of entries requested. If `None`, will return valid
-                entries in the range of whole data pack.
+                range of entries requested. This value can be given by an
+                entry object or the ``tid`` of that entry. If `None`, will
+                return valid entries in the range of whole data pack.
             components: The component (creator)
                 generating the entries requested. If `None`, will return valid
                 entries generated by any component.
             include_sub_type: whether to consider the sub types of
                 the provided entry type. Default `True`.
+            get_raw: boolean to indicate if the entry should be returned in
+                its primitive form as opposed to an object. False by default
 
         Yields:
             Each `Entry` found using this method.
         """
-        entry_type_: Type[EntryType] = as_entry_type(entry_type)
+        # Convert entry_type to str
+        entry_type_ = (
+            get_full_module_name(entry_type)
+            if not isinstance(entry_type, str)
+            else entry_type
+        )
+
+        # pylint: disable=protected-access
+        # Check if entry_type_ represents a valid entry
+        if not self._data_store._is_subclass(entry_type_, Entry):
+            raise ValueError(
+                f"The specified entry type [{entry_type}] "
+                f"does not correspond to a "
+                f"`forte.data.ontology.core.Entry` class"
+            )
 
         def require_annotations(entry_class=Annotation) -> bool:
-            if issubclass(entry_type_, entry_class):
+            if self._data_store._is_subclass(entry_type_, entry_class):
                 return True
-            if issubclass(entry_type_, Link):
+
+            curr_class: Type[EntryType] = as_entry_type(entry_type_)
+            if issubclass(curr_class, Link):
                 return issubclass(
-                    entry_type_.ParentType, entry_class
-                ) and issubclass(entry_type_.ChildType, entry_class)
-            if issubclass(entry_type_, Group):
-                return issubclass(entry_type_.MemberType, entry_class)
+                    curr_class.ParentType, entry_class
+                ) and issubclass(curr_class.ChildType, entry_class)
+            if issubclass(curr_class, Group):
+                return issubclass(curr_class.MemberType, entry_class)
             return False
 
         # If we don't have any annotations but the items to check requires them,
         # then we simply yield from an empty list.
+        # changed form using len(annotations) to num_annotations directly for
+        # improving the performance.
         if (
-            len(self.annotations) == 0
+            self.num_annotations == 0
             and isinstance(range_annotation, Annotation)
             and require_annotations(Annotation)
         ) or (
-            len(self.audio_annotations) == 0
+            self.num_audio_annotations == 0
             and isinstance(range_annotation, AudioAnnotation)
             and require_annotations(AudioAnnotation)
         ):
@@ -1477,45 +1633,63 @@ class DataPack(BasePack[Entry, Link, Group]):
             yield from []
             return
 
-        # Valid entry ids based on type.
-        all_types: Set[Type]
-        if include_sub_type:
-            all_types = self._expand_to_sub_types(entry_type_)
-        else:
-            all_types = {entry_type_}
+        # If range_annotation is specified, we record its begin and
+        # end index
+        range_begin: int
+        range_end: int
 
-        entry_iter: Iterator[Entry]
-        if issubclass(entry_type_, Generics):
-            entry_iter = self.generics
-        elif isinstance(range_annotation, (Annotation, AudioAnnotation)):
-            if (
-                issubclass(entry_type_, Annotation)
-                or issubclass(entry_type_, Link)
-                or issubclass(entry_type_, Group)
-                or issubclass(entry_type_, AudioAnnotation)
+        if range_annotation is not None:
+            if isinstance(range_annotation, AnnotationLikeEntries):
+                range_begin = range_annotation.begin
+                range_end = range_annotation.end
+            else:
+                # range_annotation is given by the tid of the entry it
+                # represents
+                range_raw = self._data_store.transform_data_store_entry(
+                    self.get_entry_raw(range_annotation)
+                )
+                range_begin = range_raw[BEGIN_ATTR_NAME]
+                range_end = range_raw[END_ATTR_NAME]
+
+        try:
+            for entry_data in self._data_store.get(
+                type_name=entry_type_,
+                include_sub_type=include_sub_type,
+                range_span=range_annotation  # type: ignore
+                and (range_begin, range_end),
             ):
-                entry_iter = self.iter_in_range(entry_type_, range_annotation)
-        elif issubclass(entry_type_, Annotation):
-            entry_iter = self.annotations
-        elif issubclass(entry_type_, Link):
-            entry_iter = self.links
-        elif issubclass(entry_type_, Group):
-            entry_iter = self.groups
-        elif issubclass(entry_type_, AudioAnnotation):
-            entry_iter = self.audio_annotations
-        else:
-            raise ValueError(
-                f"The requested type {str(entry_type_)} is not supported."
-            )
 
-        for entry in entry_iter:
-            # Filter by type and components.
-            if type(entry) not in all_types:
-                continue
-            if components is not None:
-                if not self.is_created_by(entry, components):
-                    continue
-            yield entry  # type: ignore
+                # Filter by components
+                if components is not None:
+                    if not self.is_created_by(
+                        entry_data[TID_INDEX], components
+                    ):
+                        continue
+
+                entry: Union[Entry, Dict[str, Any]]
+                if get_raw:
+                    entry = self._data_store.transform_data_store_entry(
+                        entry_data
+                    )
+                else:
+                    entry = self.get_entry(tid=entry_data[TID_INDEX])
+
+                    # Filter out incompatible audio span comparison for Links and Groups
+                    if (
+                        self._data_store._is_subclass(
+                            entry_type_, (Link, Group)
+                        )
+                        and isinstance(range_annotation, AudioAnnotation)
+                        and not self._index.in_audio_span(
+                            entry, range_annotation.span
+                        )
+                    ):
+                        continue
+
+                yield entry  # type: ignore
+        except ValueError:
+            # type_name does not exist in DataStore
+            yield from []
 
     def update(self, datapack: "DataPack"):
         r"""Update the attributes and properties of the current DataPack with
@@ -1528,8 +1702,24 @@ class DataPack(BasePack[Entry, Link, Group]):
         #   better solution.
         self.__dict__.update(datapack.__dict__)
 
+    def _save_entry_to_data_store(self, entry: Entry):
+        r"""Save an existing entry object into DataStore"""
+        self._entry_converter.save_entry_object(entry=entry, pack=self)
 
-class DataIndex(BaseIndex):
+        if isinstance(entry, Payload):
+            if entry.modality == Modality.Text:
+                self.text_payloads.append(entry)
+            elif entry.modality == Modality.Audio:
+                self.audio_payloads.append(entry)
+            elif entry.modality == Modality.Image:
+                self.image_payloads.append(entry)
+
+    def _get_entry_from_data_store(self, tid: int) -> Entry[Any]:
+        r"""Generate a class object from entry data in DataStore"""
+        return self._entry_converter.get_entry_object(tid=tid, pack=self)
+
+
+class DataIndex(BaseIndex[Entry]):
     r"""A set of indexes used in :class:`~forte.data.data_pack.DataPack`, note that this class is
     used by the `DataPack` internally.
 
@@ -1558,12 +1748,12 @@ class DataIndex(BaseIndex):
     def __init__(self):
         super().__init__()
         self._coverage_index: Dict[
-            Tuple[Type[Union[Annotation, AudioAnnotation]], Type[EntryType]],
+            Tuple[Type[Union[Annotation, AudioAnnotation]], Type[Entry]],
             Dict[int, Set[int]],
         ] = {}
         self._coverage_index_valid = True
 
-    def remove_entry(self, entry: EntryType):
+    def remove_entry(self, entry: Entry):
         super().remove_entry(entry)
         self.deactivate_coverage_index()
 
@@ -1678,12 +1868,12 @@ class DataIndex(BaseIndex):
                 checked, or the ``tid`` of the Annotation.
         """
         entry1_: Union[Annotation, AudioAnnotation] = (
-            self._entry_index[entry1]
+            self._entry_index[entry1]  # type: ignore
             if isinstance(entry1, (int, np.integer))
             else entry1
         )
         entry2_: Union[Annotation, AudioAnnotation] = (
-            self._entry_index[entry2]
+            self._entry_index[entry2]  # type: ignore
             if isinstance(entry2, (int, np.integer))
             else entry2
         )

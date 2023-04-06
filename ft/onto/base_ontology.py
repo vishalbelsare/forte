@@ -1,5 +1,5 @@
 # ***automatically_generated***
-# ***source json:forte/ontology_specs/base_ontology.json***
+# ***source json:/Users/hector/Documents/projects/forte/forte/ontology_specs/base_ontology.json***
 # flake8: noqa
 # mypy: ignore-errors
 # pylint: skip-file
@@ -8,7 +8,6 @@ Automatically generated ontology base_ontology. Do not change manually.
 """
 
 from dataclasses import dataclass
-from forte.data.base_pack import PackType
 from forte.data.data_pack import DataPack
 from forte.data.multi_pack import MultiPack
 from forte.data.ontology.core import Entry
@@ -26,6 +25,7 @@ from typing import List
 from typing import Optional
 
 __all__ = [
+    "Character",
     "Token",
     "Subword",
     "Classification",
@@ -55,6 +55,16 @@ __all__ = [
     "Recording",
     "AudioUtterance",
 ]
+
+
+@dataclass
+class Character(Annotation):
+    """
+    A span based annotation :class:`Character`, used to represent a character.
+    """
+
+    def __init__(self, pack: DataPack, begin: int, end: int):
+        super().__init__(pack, begin, end)
 
 
 @dataclass
@@ -337,9 +347,8 @@ class Dependency(Link):
 @dataclass
 class EnhancedDependency(Link):
     """
-    A `Link` type entry which represent a `enhanced dependency
-    <https://universaldependencies.org/u/overview/enhanced-syntax.html>`_.
-
+    A `Link` type entry which represent a enhanced dependency: 
+     https://universaldependencies.org/u/overview/enhanced-syntax.html
     Attributes:
         dep_label (Optional[str]):	The enhanced dependency label in Universal Dependency.
     """
@@ -540,7 +549,7 @@ class Recording(AudioAnnotation):
 
     recording_class: List[str]
 
-    def __init__(self, pack: PackType, begin: int, end: int):
+    def __init__(self, pack: DataPack, begin: int, end: int):
         super().__init__(pack, begin, end)
         self.recording_class: List[str] = []
 
@@ -555,6 +564,6 @@ class AudioUtterance(AudioAnnotation):
 
     speaker: Optional[str]
 
-    def __init__(self, pack: PackType, begin: int, end: int):
+    def __init__(self, pack: DataPack, begin: int, end: int):
         super().__init__(pack, begin, end)
         self.speaker: Optional[str] = None

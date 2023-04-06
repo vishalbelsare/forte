@@ -16,16 +16,17 @@ import copy
 import logging
 
 from pathlib import Path
-from typing import Dict, List, Set, Union, Iterator, Optional, Type, Any, Tuple
+from typing import Dict, List, Union, Iterator, Optional, Type, Any, Tuple, cast
 
-import jsonpickle
-
-from sortedcontainers import SortedList
 from packaging.version import Version
+from sortedcontainers import SortedList
 
 from forte.common import ProcessExecutionException
+from forte.common.constants import TID_INDEX, ENTRY_TYPE_INDEX
 from forte.data.base_pack import BaseMeta, BasePack
 from forte.data.data_pack import DataPack
+from forte.data.data_store import DataStore
+from forte.data.entry_converter import EntryConverter
 from forte.data.index import BaseIndex
 from forte.data.ontology.core import Entry
 from forte.data.ontology.core import EntryType
@@ -37,8 +38,7 @@ from forte.data.ontology.top import (
     MultiPackGeneric,
 )
 from forte.data.types import DataRequest
-from forte.utils import get_class
-from forte.version import DEFAULT_PACK_VERSION, PACK_ID_COMPATIBLE_VERSION
+from forte.utils import get_full_module_name
 
 
 logger = logging.getLogger(__name__)
@@ -51,6 +51,10 @@ __all__ = [
 ]
 
 MdRequest = Dict[Type[Union[MultiPackLink, MultiPackGroup]], Union[Dict, List]]
+
+# Before this, version, data packs are indexed in multipack using the index,
+# but afterwards, they are indexed by the pack id.
+version_indexed_by_pack_id = "0.0.1"
 
 
 class MultiPackMeta(BaseMeta):
@@ -84,12 +88,11 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
         # Reference to the real packs.
         self._packs: List[DataPack] = []
 
-        self.links: SortedList[MultiPackLink] = SortedList()
-        self.groups: SortedList[MultiPackGroup] = SortedList()
-        self.generics: SortedList[MultiPackGeneric] = SortedList()
-
         # Used to automatically give name to sub packs.
         self.__default_pack_prefix = "_pack"
+
+        self._data_store = DataStore()
+        self._entry_converter = EntryConverter()
 
         self._index: MultiIndex = MultiIndex()
 
@@ -97,26 +100,12 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
         r"""In deserialization, we set up the index and the references to the
         data packs inside.
         """
+        self._entry_converter = EntryConverter()
         super().__setstate__(state)
-
-        self.links = SortedList(self.links)
-        self.groups = SortedList(self.groups)
-        self.generics = SortedList(self.generics)
 
         self._index = MultiIndex()
         # TODO: index those pointers?
-        self._index.update_basic_index(list(self.links))
-        self._index.update_basic_index(list(self.groups))
-        self._index.update_basic_index(list(self.generics))
-
-        for a in self.links:
-            a.set_pack(self)
-
-        for a in self.groups:
-            a.set_pack(self)
-
-        for a in self.generics:
-            a.set_pack(self)
+        self._index.update_basic_index(list(iter(self)))
 
         # Rebuild the name to index lookup.
         self._name_index = {n: i for (i, n) in enumerate(self._pack_names)}
@@ -136,14 +125,6 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
             None
         """
         self._packs.extend(packs)
-        for a in self.links:
-            a.relink_pointer()
-
-        for a in self.groups:
-            a.relink_pointer()
-
-        for a in self.generics:
-            a.relink_pointer()
 
     def __getstate__(self):
         r"""
@@ -155,11 +136,7 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
         state = super().__getstate__()
         # Do not directly serialize the pack itself.
         state.pop("_packs")
-
-        state["links"] = list(state["links"])
-        state["groups"] = list(state["groups"])
-        state["generics"] = list(state["generics"])
-
+        state.pop("_entry_converter")
         return state
 
     def __iter__(self):
@@ -173,19 +150,18 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
     def _validate(self, entry: EntryType) -> bool:
         return isinstance(entry, MultiPackEntries)
 
-    # TODO: get_subentry maybe useless
     def get_subentry(self, pack_idx: int, entry_id: int):
         r"""
-        Get sub_entry from multi pack. This method uses `pack_id` (a unique
-        identifier assigned to datapack) to get a pack from multi pack,
-        and then return its sub_entry with entry_id. Noted this is changed from
-        the way of accessing such pack before the PACK_ID_COMPATIBLE_VERSION,
+        Get `sub_entry` from `multi pack`. This method uses `pack_id` (a unique
+        identifier assigned to datapack) to get a pack from `multi pack`,
+        and then return its sub_entry with entry_id.
+
+        Noted this is changed from the way of accessing such pack before v0.0.1,
         in which the `pack_idx` was used as list index number to access/reference
-        a pack within the multi pack (and in this case then get the sub_entry).
+        a pack within the `multi pack` (and in this case then get the `sub_entry`).
 
         Args:
-            pack_idx: The pack_id for the data_pack in the
-              multi pack.
+            pack_idx: The pack_id for the data_pack in the multi pack.
             entry_id: the id for the entry from the pack with pack_id
 
         Returns:
@@ -195,7 +171,7 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
         pack_array_index: int = pack_idx  # the old way
         # the following check if the pack version is higher than the (backward)
         # compatible version in which pack_idx is the pack_id not list index
-        if Version(self.pack_version) >= Version(PACK_ID_COMPATIBLE_VERSION):
+        if Version(self.pack_version) >= Version(version_indexed_by_pack_id):
             pack_array_index = self.get_pack_index(
                 pack_idx
             )  # the new way: using pack_id instead of array index
@@ -318,10 +294,7 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
         for link in self.get(MultiPackLink):
             parent_entry_pid = link.get_parent().pack_id
             child_entry_pid = link.get_child().pack_id
-            if (
-                parent_entry_pid == pack.pack_id
-                or child_entry_pid == pack.pack_id
-            ):
+            if pack.pack_id in (parent_entry_pid, child_entry_pid):
                 links_with_pack_for_removal.append(link)
 
         groups_with_pack_for_removal = []
@@ -388,19 +361,19 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
         # Remove those None in place and shrink the _pack_ref list.
         # Caution: item index will change
         for index in range(len(self._pack_ref) - 1, 0, -1):
-            if self._pack_ref.__getitem__(index) is None:
-                self._pack_ref.__delitem__(index)
+            if self._pack_ref[index] is None:
+                del self._pack_ref[index]
 
         # Remove those None in place and shrink the _pack_names list.
         # Caution: item index will change
         for index in range(len(self._pack_names) - 1, 0, -1):
-            if not self._pack_names.__getitem__(index):
-                self._pack_names.__delitem__(index)
+            if not self._pack_names[index]:
+                del self._pack_names[index]
 
         # Remove those None in place and shrink the _packs list. Caution: item index will change
         for index in range(len(self._packs) - 1, 0, -1):
-            if self._packs.__getitem__(index) is None:
-                self._packs.__delitem__(index)
+            if self._packs[index] is None:
+                del self._packs[index]
 
         return True
 
@@ -578,18 +551,23 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
             :class:`~forte.data.ontology.top.MultiPackLink`.
 
         """
-        yield from self.links
+        for entry in self._data_store.all_entries(
+            "forte.data.ontology.top.MultiPackLink"
+        ):
+            yield self.get_entry(tid=entry[TID_INDEX])  # type: ignore
 
     @property
     def num_links(self) -> int:
         """
-        Number of groups in this multi pack.
+        Number of links in this multi pack.
 
         Returns:
             Number of links.
 
         """
-        return len(self.groups)
+        return self._data_store.num_entries(
+            "forte.data.ontology.top.MultiPackLink"
+        )
 
     @property
     def all_groups(self) -> Iterator[MultiPackGroup]:
@@ -601,7 +579,10 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
             :class:`~forte.data.ontology.top.MultiPackGroup`.
 
         """
-        yield from self.groups
+        for entry in self._data_store.all_entries(
+            "forte.data.ontology.top.MultiPackGroup"
+        ):
+            yield self.get_entry(tid=entry[TID_INDEX])  # type: ignore
 
     @property
     def num_groups(self) -> int:
@@ -612,11 +593,56 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
             Number of groups.
 
         """
-        return len(self.groups)
+        return self._data_store.num_entries(
+            "forte.data.ontology.top.MultiPackGroup"
+        )
 
     @property
     def generic_entries(self) -> Iterator[MultiPackGeneric]:
-        yield from self.generics
+        """
+        An iterator of all generics in this multi pack.
+
+        Returns:
+            Iterator of all generics, of type
+            :class:`~forte.data.ontology.top.MultiPackGeneric`.
+
+        """
+        for entry in self._data_store.all_entries(
+            "forte.data.ontology.top.MultiPackGeneric"
+        ):
+            yield self.get_entry(tid=entry[TID_INDEX])  # type: ignore
+
+    @property
+    def links(self):
+        """
+        A List container of all links in this multi pack.
+
+        Returns: List of all links, of
+        type :class:`~forte.data.ontology.top.MultiPackLink`.
+
+        """
+        return SortedList(self.all_links)
+
+    @property
+    def groups(self):
+        """
+        A List container of all groups in this multi pack.
+
+        Returns: List of all groups, of
+        type :class:`~forte.data.ontology.top.MultiPackGroup`.
+
+        """
+        return SortedList(self.all_groups)
+
+    @property
+    def generics(self):
+        """
+        A SortedList container of all generic entries in this multi pack.
+
+        Returns: SortedList of generics
+
+        """
+        return SortedList(self.generic_entries)
 
     def add_all_remaining_entries(self, component: Optional[str] = None):
         """
@@ -738,9 +764,7 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
         # TODO: Not finished yet
         pass
 
-    def __add_entry_with_check(
-        self, entry: EntryType, allow_duplicate: bool = True
-    ) -> EntryType:
+    def __add_entry_with_check(self, entry: Union[EntryType, int]) -> EntryType:
         r"""Internal method to add an :class:`~forte.data.ontology.core.Entry` object to the
         :class:`~forte.data.multi_pack.MultiPack` object.
 
@@ -753,43 +777,27 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
         Returns:
             The input entry itself
         """
-        if isinstance(entry, MultiPackLink):
-            target = self.links
-        elif isinstance(entry, MultiPackGroup):
-            target = self.groups
-        elif isinstance(entry, MultiPackGeneric):
-            target = self.generics
-        else:
-            raise ValueError(
-                f"Invalid entry type {type(entry)} for Multipack. A valid "
-                f"entry should be an instance of MultiPackLink, MultiPackGroup"
-                f", or MultiPackGeneric."
-            )
+        if isinstance(entry, int):
+            # If entry is a TID, convert it to the class object.
+            entry = self._entry_converter.get_entry_object(tid=entry, pack=self)  # type: ignore
 
-        add_new = allow_duplicate or (entry not in target)
+        # update the data pack index if needed
+        # TODO: MultiIndex will be deprecated in future
+        self._index.update_basic_index([entry])
+        if self._index.link_index_on and isinstance(entry, MultiPackLink):
+            self._index.update_link_index([entry])
+        if self._index.group_index_on and isinstance(entry, MultiPackGroup):
+            self._index.update_group_index([entry])
 
-        if add_new:
-            target.add(entry)
-
-            # TODO: add the pointers?
-
-            # update the data pack index if needed
-            self._index.update_basic_index([entry])
-            if self._index.link_index_on and isinstance(entry, MultiPackLink):
-                self._index.update_link_index([entry])
-            if self._index.group_index_on and isinstance(entry, MultiPackGroup):
-                self._index.update_group_index([entry])
-
-            self._pending_entries.pop(entry.tid)
-            return entry
-        else:
-            return target[target.index(entry)]
+        self._pending_entries.pop(entry.tid)  # type: ignore
+        return entry  # type: ignore
 
     def get(  # type: ignore
         self,
         entry_type: Union[str, Type[EntryType]],
         components: Optional[Union[str, List[str]]] = None,
-        include_sub_type=True,
+        include_sub_type: bool = True,
+        get_raw: bool = False,
     ) -> Iterator[EntryType]:
         """Get entries of ``entry_type`` from this multi pack.
 
@@ -814,6 +822,8 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
                 any component will be returned.
             include_sub_type: whether to return the sub types of the
                 queried `entry_type`. True by default.
+            get_raw: boolean to indicate if the entry should be returned in
+                its primitive form as opposed to an object. False by default
 
         Returns:
             An iterator of the entries matching the arguments, following
@@ -821,58 +831,59 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
             insertion)
 
         """
-        entry_type_: Type[EntryType]
-        if isinstance(entry_type, str):
-            entry_type_ = get_class(entry_type)
-            if not issubclass(entry_type_, Entry):
-                raise AttributeError(
-                    f"The specified entry type [{entry_type}] "
-                    f"does not correspond to a "
-                    f"'forte.data.ontology.core.Entry' class"
-                )
-        else:
-            entry_type_ = entry_type
+        entry_type_ = (
+            get_full_module_name(entry_type)
+            if not isinstance(entry_type, str)
+            else entry_type
+        )
 
-        entry_iter: Iterator[Entry]
-
-        if not include_sub_type:
-            entry_iter = self.get_entries_of(entry_type_)
-        elif issubclass(entry_type_, MultiPackLink):
-            entry_iter = self.links
-        elif issubclass(entry_type_, MultiPackGroup):
-            entry_iter = self.groups
-        elif issubclass(entry_type_, MultiPackGeneric):
-            entry_iter = self.generics
-        else:
+        # Check if entry_type_ represents a valid entry
+        # pylint: disable=protected-access
+        if not self._data_store._is_subclass(entry_type_, Entry):
             raise ValueError(
-                f"The entry type: {entry_type_} is not supported by MultiPack."
+                f"The specified entry type [{entry_type}] "
+                f"does not correspond to a "
+                f"`forte.data.ontology.core.Entry` class"
             )
-
-        all_types: Set[Type]
-        if include_sub_type:
-            all_types = self._expand_to_sub_types(entry_type_)
 
         if components is not None:
             if isinstance(components, str):
                 components = [components]
 
-        for e in entry_iter:
-            # Will check for the type matching if sub types are also requested.
-            if include_sub_type and type(e) not in all_types:
-                continue
+        try:
+            for entry_data in self._data_store.get(
+                type_name=entry_type_,
+                include_sub_type=include_sub_type,
+            ):
+                # Filter by components
+                if components is not None:
+                    if not self.is_created_by(
+                        entry_data[TID_INDEX], components
+                    ):
+                        continue
 
-            # Check for the component.
-            if components is not None:
-                if not self.is_created_by(e, components):
-                    continue
+                entry: Union[Entry, Dict[str, Any]]
 
-            yield e  # type: ignore
+                if get_raw:
+                    data_store = cast(DataStore, self._data_store)
+                    entry = data_store.transform_data_store_entry(entry_data)
+                else:
+                    entry = self._entry_converter.get_entry_object(
+                        tid=entry_data[TID_INDEX],
+                        pack=self,
+                        type_name=entry_data[ENTRY_TYPE_INDEX],
+                    )
+
+                yield entry  # type: ignore
+        except ValueError:
+            # type_name does not exist in DataStore
+            yield from []
 
     @classmethod
     def deserialize(
         cls,
         data_path: Union[Path, str],
-        serialize_method: str = "jsonpickle",
+        serialize_method: str = "json",
         zip_pack: bool = False,
     ) -> "MultiPack":
         """
@@ -899,7 +910,7 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
             An data pack object deserialized from the string.
         """
         # pylint: disable=protected-access
-        mp: MultiPack = cls._deserialize(data_path, serialize_method, zip_pack)
+        mp: MultiPack = cls._deserialize(data_path, serialize_method, zip_pack)  # type: ignore
 
         # (fix 595) change the dictionary's key after deserialization from str back to int
         mp._inverse_pack_ref = {
@@ -909,23 +920,20 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
         return mp
 
     @classmethod
-    def from_string(cls, data_content: str):
+    def from_string(cls, data_content: str, json_method: str = "json"):
         # pylint: disable=protected-access
         # can not use explict type hint for mp as pylint does not allow type change
         # from base_pack to multi_pack which is problematic so use jsonpickle instead
-
-        mp = jsonpickle.decode(data_content)
-        if not hasattr(mp, "pack_version"):
-            mp.pack_version = DEFAULT_PACK_VERSION
+        mp = super().from_string(data_content, json_method)
         # (fix 595) change the dictionary's key after deserialization from str back to int
-        mp._inverse_pack_ref = {  # pylint: disable=no-member
+        mp._inverse_pack_ref = {  # type: ignore  # pylint: disable=no-member
             int(k): v
-            for k, v in mp._inverse_pack_ref.items()  # pylint: disable=no-member
+            for k, v in mp._inverse_pack_ref.items()  # type: ignore  # pylint: disable=no-member
         }
 
         return mp
 
-    def _add_entry(self, entry: EntryType) -> EntryType:
+    def _add_entry(self, entry: Union[Entry, int]) -> Entry[Any]:
         r"""Force add an :class:`forte.data.ontology.core.Entry` object to the
         :class:`~forte.data.multi_pack.MultiPack` object.
 
@@ -938,41 +946,7 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
         Returns:
             The input entry itself
         """
-        return self.__add_entry_with_check(entry, True)
-
-    def delete_entry(self, entry: EntryType):
-        r"""Delete an :class:`~forte.data.ontology.core.Entry` object from the
-        :class:`~forte.data.multi_pack.MultiPack`.
-
-        Args:
-            entry: An :class:`~forte.data.ontology.core.Entry`
-                object to be deleted from the pack.
-
-        """
-        if isinstance(entry, MultiPackLink):
-            target = self.links
-        elif isinstance(entry, MultiPackGroup):
-            target = self.groups
-        elif isinstance(entry, MultiPackGeneric):
-            target = self.generics
-        else:
-            raise ValueError(
-                f"Invalid entry type {type(entry)}. A valid entry "
-                f"should be an instance of Annotation, Link, or Group."
-            )
-
-        begin = 0
-        for i, e in enumerate(target[begin:]):
-            if e.tid == entry.tid:
-                target.pop(i + begin)
-                break
-
-        # update basic index
-        self._index.remove_entry(entry)
-
-        # set other index invalid
-        self._index.turn_link_index_switch(on=False)
-        self._index.turn_group_index_switch(on=False)
+        return self.__add_entry_with_check(entry)
 
     @classmethod
     def validate_link(cls, entry: EntryType) -> bool:
@@ -984,6 +958,14 @@ class MultiPack(BasePack[Entry, MultiPackLink, MultiPackGroup]):
 
     def view(self):
         return copy.deepcopy(self)
+
+    def _save_entry_to_data_store(self, entry: Entry):
+        r"""Save an existing entry object into DataStore"""
+        self._entry_converter.save_entry_object(entry=entry, pack=self)
+
+    def _get_entry_from_data_store(self, tid: int) -> Entry[Any]:
+        r"""Generate a class object from entry data in DataStore"""
+        return self._entry_converter.get_entry_object(tid=tid, pack=self)
 
 
 class MultiIndex(BaseIndex):

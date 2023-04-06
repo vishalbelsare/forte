@@ -24,25 +24,11 @@ from typing import Dict, Generic, Set, Tuple, TypeVar, Iterator
 __all__ = [
     "EntryContainer",
     "ContainerType",
-    "BasePointer",
 ]
 
 E = TypeVar("E")
 L = TypeVar("L")
 G = TypeVar("G")
-
-
-class BasePointer:
-    """
-    Objects to point to other objects in the data pack.
-    """
-
-    def __str__(self):
-        raise NotImplementedError
-
-    def __getstate__(self):
-        state = self.__dict__.copy()
-        return state
 
 
 class EntryContainer(Generic[E, L, G]):
@@ -66,12 +52,26 @@ class EntryContainer(Generic[E, L, G]):
         if "field_records" in self.__dict__:
             self._field_records = self.__dict__.pop("field_records")
 
-    @abstractmethod
-    def on_entry_creation(self, entry: E):
-        raise NotImplementedError
+        for record_field in ("_creation_records", "_field_records"):
+            setattr(
+                self,
+                record_field,
+                {
+                    key: set(val)
+                    for key, val in getattr(self, record_field).items()
+                },
+            )
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for record_field in ("_creation_records", "_field_records"):
+            state[record_field] = {
+                key: list(val) for key, val in state.pop(record_field).items()
+            }
+        return state
 
     @abstractmethod
-    def regret_creation(self, entry: E):
+    def on_entry_creation(self, entry: E):
         raise NotImplementedError
 
     @abstractmethod

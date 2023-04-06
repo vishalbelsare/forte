@@ -77,7 +77,7 @@ Some components or modules in forte may require some [extra requirements](https:
 * `pip install forte[wikipedia]`: Install packages required for reading [wikipedia datasets](https://github.com/asyml/forte/tree/master/forte/datasets/wikipedia).
 * `pip install forte[nlp]`: Install packages required for additional NLP supports, such as [subword_tokenizer](https://github.com/asyml/forte/tree/master/forte/processors/nlp/subword_tokenizer.py) and [texar encoder](https://github.com/asyml/forte/tree/master/forte/processors/third_party/pretrained_encoder_processors.py)
 * `pip install forte[extractor]`: Install packages required for extractor-based training system, [extractor](https://github.com/asyml/forte/blob/master/forte/data/extractors), [train_preprocessor](https://github.com/asyml/forte/tree/master/forte/train_preprocessor.py), [tagging trainer](https://github.com/asyml/forte/tree/master/examples/tagging/tagging_trainer.py), [DataPack dataset](https://github.com/asyml/forte/blob/master/forte/data/data_pack_dataset.py), [types](https://github.com/asyml/forte/blob/master/forte/data/types.py), and [converter](https://github.com/asyml/forte/blob/master/forte/data/converter).
-
+* `pip install forte[payload]` install packages required for payload.
 ## Quick Start Guide
 Writing NLP pipelines with Forte is easy. The following example creates a simple pipeline that analyzes the sentences, tokens, and named entities from a piece of text.
 
@@ -89,7 +89,6 @@ pip install forte.spacy
 Let's start by writing a simple processor that analyze POS tags to tokens using the good old NLTK library.
 ```python
 import nltk
-
 from forte.processors.base import PackProcessor
 from forte.data.data_pack import DataPack
 from ft.onto.base_ontology import Token
@@ -111,7 +110,7 @@ class NLTKPOSTagger(PackProcessor):
         taggings = nltk.pos_tag(token_texts)
 
         # assign nltk taggings to token attributes
-        for token, tag in zip(token_entries, taggings):
+        for token, tag in zip(input_pack.get(Token), taggings):
             token.pos = tag[1]
 ```
 If we break it down, we will notice there are two main functions.
@@ -126,30 +125,36 @@ a full pipeline.
 ```python
 from forte import Pipeline
 
-from forte.data.readers import TerminalReader
+from forte.data.readers import StringReader
 from fortex.spacy import SpacyProcessor
 
 pipeline: Pipeline = Pipeline[DataPack]()
-pipeline.set_reader(TerminalReader())
+pipeline.set_reader(StringReader())
 pipeline.add(SpacyProcessor(), {"processors": ["sentence", "tokenize"]})
 pipeline.add(NLTKPOSTagger())
 ```
 
 Here we have successfully created a pipeline with a few components:
-* a `TerminalReader` that reads data from terminal
+* a `StringReader` that reads data from a string.
 * a `SpacyProcessor` that calls SpaCy to split the sentences and create tokenization
 * and finally the brand new `NLTKPOSTagger` we just implemented,
 
 Let's see it run in action!
 
 ```python
-for pack in pipeline.initialize().process_dataset():
+input_string = "Forte is a data-centric ML framework"
+for pack in pipeline.initialize().process_dataset(input_string):
     for sentence in pack.get("ft.onto.base_ontology.Sentence"):
         print("The sentence is: ", sentence.text)
         print("The POS tags of the tokens are:")
         for token in pack.get(Token, sentence):
-            print(f" {token.text}({token.pos})", end = " ")
+            print(f" {token.text}[{token.pos}]", end = " ")
         print()
+```
+It gives us output as follows:
+
+```
+Forte[NNP]  is[VBZ]  a[DT]  data[NN]  -[:]  centric[JJ]  ML[NNP]  framework[NN]  .[.]
 ```
 
 We have successfully created a simple pipeline. In the nutshell, the `DataPack`s are

@@ -130,19 +130,14 @@ class ForteHTMLParser(HTMLParser):
             if startswith("<", i):
                 if starttagopen.match(rawdata, i):  # < + letter
                     k = self.parse_starttag(i)
-                    self.collect_span(i, k)
                 elif startswith("</", i):
                     k = self.parse_endtag(i)
-                    self.collect_span(i, k)
                 elif startswith("<!--", i):
                     k = self.parse_comment(i)
-                    self.collect_span(i, k)
                 elif startswith("<?", i):
                     k = self.parse_pi(i)
-                    self.collect_span(i, k)
                 elif startswith("<!", i):
                     k = self.parse_html_declaration(i)
-                    self.collect_span(i, k)
                 elif (i + 1) < n:
                     self.handle_data("<")
                     k = i + 1
@@ -162,6 +157,8 @@ class ForteHTMLParser(HTMLParser):
                         self.handle_data(unescape(rawdata[i:k]))
                     else:
                         self.handle_data(rawdata[i:k])
+                if k > i:
+                    self.collect_span(i, k)
                 i = self.updatepos(i, k)
             elif startswith("&#", i):
                 match = charref.match(rawdata, i)
@@ -228,7 +225,7 @@ class HTMLReader(PackReader):
         self.init_with_fileloc = False
         self.init_with_html = False
 
-    def _collect(self, content) -> Iterator[str]:  # type: ignore
+    def _collect(self, content) -> Iterator[str]:
         r"""Could be called with a directory, a particular file location or a
         list of strings. If the string is an HTML string, it will be cleaned.
 
